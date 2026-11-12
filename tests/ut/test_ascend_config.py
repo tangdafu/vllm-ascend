@@ -1829,13 +1829,39 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         vc = VllmConfig()
         vc.additional_config = {
             "enable_pcp_o_proj_weight_sharding": "true",
+            "enable_pcp_indexer_sharding": "false",
+            "pcp_indexer_sharding_min_seq_len": "16384",
             "draft_window_size": "4096",
         }
 
         config = init_ascend_config(vc)
 
         self.assertTrue(config.enable_pcp_o_proj_weight_sharding)
+        self.assertFalse(config.enable_pcp_indexer_sharding)
+        self.assertEqual(config.pcp_indexer_sharding_min_seq_len, 16384)
         self.assertEqual(config.draft_window_size, 4096)
+
+    def test_pcp_indexer_rejects_incompatible_parallel_and_graph_modes(self):
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            AscendConfig._validate_user_input_ranges(SimpleNamespace(pcp_indexer_sharding_min_seq_len=-1))
+        config = SimpleNamespace(
+            enable_pcp_indexer_sharding=True,
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+        )
+        for pcp, dcp, mode, error in (
+            (1, 1, CUDAGraphMode.NONE, "PCP > 1"),
+            (2, 2, CUDAGraphMode.NONE, "DCP = 1"),
+            (2, 1, CUDAGraphMode.FULL_DECODE_ONLY, "full graphs"),
+        ):
+            with self.subTest(pcp=pcp, dcp=dcp, mode=mode):
+                vc = SimpleNamespace(
+                    parallel_config=SimpleNamespace(
+                        prefill_context_parallel_size=pcp, decode_context_parallel_size=dcp
+                    ),
+                    compilation_config=SimpleNamespace(cudagraph_mode=mode),
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    AscendConfig.derive_and_validate(config, vc)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

@@ -21,11 +21,19 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.utils import select_common_block_size
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import get_ascend_config, validate_additional_config_bool
 from vllm_ascend.attention.context_parallel.common_cp import (
     build_pcp_ordered_slot_mapping,
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
+)
+from vllm_ascend.attention.context_parallel.pcp_indexer import (
+    PCPIndexerMetadata,
+    build_pcp_indexer_metadata,
+    finish_pcp_indexer_topk,
+    prepare_pcp_indexer_queries,
+    select_pcp_indexer_candidates,
+    supports_pcp_indexer_sharding,
 )
 from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
     build_sfa_dcp_replicated_block_table,
@@ -86,6 +94,7 @@ class AscendSFAIndexerMetadata:
     # The selector receives ``(q_li, weights, indexer, metadata, q_li_scale)``;
     # ``q_li_scale`` is set only when LI C8 has already quantized ``q_li``.
     topk_selector: Any | None = None
+    pcp_indexer: PCPIndexerMetadata | None = None
 
 
 class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
@@ -441,6 +450,16 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         if not compute_topk:
             return None
 
+        pcp_indexer = getattr(indexer_metadata, "pcp_indexer", None)
+        if pcp_indexer is not None and (
+            not self.enable_sparse_li_c8
+            or not supports_pcp_indexer_sharding(self.c8_k_cache_dtype, self.n_head, self.head_dim, self.topk_tokens)
+            or getattr(indexer_metadata, "topk_selector", None) is not None
+        ):
+            pcp_indexer = None
+        if indexer_metadata.num_actual_tokens == 0 and pcp_indexer is None:
+            return None
+
         assert self.wk_weights_proj is not None
         assert self.wq_b is not None
         assert indexer_metadata.actual_seq_lengths_query is not None
@@ -505,21 +524,46 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         topk_selector = getattr(indexer_metadata, "topk_selector", None)
         if topk_selector is not None:
             return topk_selector(q_li, weights, self, indexer_metadata, q_li_scale)
-        return DeviceOperator.indexer_select_post_process(
-            q_li,
-            q_li_scale,
-            q_li_shape_ori,
-            weights,
-            self.k_cache.kv_cache,
-            INDEXER_K_CACHE_SLOT,
-            INDEXER_SCALE_CACHE_SLOT,
-            indexer_metadata,
-            indexer_metadata.actual_seq_lengths_query,
-            indexer_metadata.actual_seq_lengths_key,
-            self.enable_sparse_li_c8,
-            self.enable_sparse_li_c4,
-            self.use_torch_npu_lightning_indexer,
-        )
+        query_lens = indexer_metadata.actual_seq_lengths_query
+        key_lens = indexer_metadata.actual_seq_lengths_key
+        if pcp_indexer is not None:
+            assert pcp_indexer.batch is not None
+            q_li, weights, q_li_scale = prepare_pcp_indexer_queries(
+                q_li.view(-1, self.n_head, self.head_dim), weights, q_li_scale, pcp_indexer
+            )
+            assert q_li_scale is not None
+            topk_indices, topk_scores = select_pcp_indexer_candidates(
+                q_li,
+                weights,
+                q_li_scale,
+                self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT],
+                self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
+                pcp_indexer,
+                self.topk_tokens,
+            )
+            return finish_pcp_indexer_topk(topk_indices, topk_scores, pcp_indexer, hidden_states.shape[0])
+        if indexer_metadata.num_actual_tokens > 0:
+            topk_indices = DeviceOperator.indexer_select_post_process(
+                q_li,
+                q_li_scale,
+                q_li_shape_ori,
+                weights,
+                self.k_cache.kv_cache,
+                INDEXER_K_CACHE_SLOT,
+                INDEXER_SCALE_CACHE_SLOT,
+                indexer_metadata,
+                query_lens,
+                key_lens,
+                self.enable_sparse_li_c8,
+                self.enable_sparse_li_c4,
+                self.use_torch_npu_lightning_indexer,
+                topk_tokens=self.topk_tokens,
+            )
+        else:
+            topk_indices = torch.full(
+                (hidden_states.shape[0], 1, self.topk_tokens), -1, dtype=torch.int32, device=hidden_states.device
+            )
+        return topk_indices
 
 
 class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerMetadata]):
@@ -553,6 +597,15 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             self.decode_threshold += speculative_config.num_speculative_tokens
 
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
+        additional_config = vllm_config.additional_config or {}
+        self.pcp_indexer_sharding = (
+            self.use_pcp
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+            and validate_additional_config_bool(
+                additional_config.get("enable_pcp_indexer_sharding", False), "enable_pcp_indexer_sharding"
+            )
+        )
+        self.pcp_indexer_min_seq_len = int(additional_config.get("pcp_indexer_sharding_min_seq_len", 8192))
         self._group_metadata_buffers: dict[
             object,
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -951,6 +1004,15 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
                 ),
             )
 
+        pcp_indexer = None
+        if self.pcp_indexer_sharding and self.speculative_config is None and is_pcp_sharded and pcp_context is not None:
+            cache_group = kwargs.get("pcp_cache_group_idx")
+            if cache_group is None:
+                raise RuntimeError("PCP indexer sharding requires the global cache-group index")
+            pcp_indexer = build_pcp_indexer_metadata(
+                common_attn_metadata, pcp_context, cache_group, block_size, self.pcp_indexer_min_seq_len
+            )
+
         return AscendSFAIndexerMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             slot_mapping=slot_mapping,
@@ -964,4 +1026,5 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             actual_seq_lengths_key=actual_seq_lengths_key,
             num_decode_tokens=num_decode_tokens,
             uses_pcp_sharded_layout=is_pcp_sharded,
+            pcp_indexer=pcp_indexer,
         )

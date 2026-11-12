@@ -2000,7 +2000,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 q_c,
                 k_hidden_states,
                 indexer_attn_metadata,
-                compute_topk=not self.skip_topk and has_local_query,
+                compute_topk=not self.skip_topk
+                and (has_local_query or getattr(indexer_attn_metadata, "pcp_indexer", None) is not None),
             )
             if self.skip_topk:
                 topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)

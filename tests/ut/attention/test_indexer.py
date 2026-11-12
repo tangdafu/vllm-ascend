@@ -25,6 +25,7 @@ def _make_builder(
     pcp_size: int = 1,
     dcp_size: int = 1,
     num_speculative_tokens: int | None = None,
+    pcp_indexer_sharding: bool = False,
 ) -> AscendSFAIndexerMetadataBuilder:
     kv_cache_spec = FullAttentionSpec(
         block_size=128,
@@ -34,6 +35,7 @@ def _make_builder(
     )
     layer_names = ["model.layers.0.self_attn.indexer.k_cache"]
     vllm_config = MagicMock()
+    vllm_config.additional_config = {"enable_pcp_indexer_sharding": pcp_indexer_sharding}
     vllm_config.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(index_topk=2048),
         hf_config=SimpleNamespace(),
@@ -104,6 +106,131 @@ def test_sfa_indexer_backend_contract():
         160,
     )
     assert AscendSFAIndexerBackend.get_supported_kernel_block_sizes() == [128]
+
+
+@pytest.mark.parametrize("enabled,spec_tokens,expected", [(False, None, False), (True, None, True), (True, 2, False)])
+def test_pcp_indexer_builder_only_selects_non_speculative_target(monkeypatch, enabled, spec_tokens, expected):
+    builder = _make_builder(pcp_size=2, num_speculative_tokens=spec_tokens, pcp_indexer_sharding=enabled)
+    common = _make_common_metadata()
+    common.pcp_context = _make_decode_pcp_context()
+    common.pcp_cache_group_idx = 0
+    selected = object()
+    select = Mock(return_value=selected)
+    monkeypatch.setattr("vllm_ascend.attention.indexer.build_pcp_indexer_metadata", select)
+    monkeypatch.setattr(
+        "vllm_ascend.attention.indexer.get_cos_and_sin_mla",
+        lambda *args, **kwargs: (torch.zeros(5, 1, 1, 8), torch.zeros(5, 1, 1, 8)),
+    )
+    metadata = builder.build(0, common)
+    assert metadata.pcp_indexer is (selected if expected else None)
+    assert select.call_count == int(expected)
+
+
+@pytest.mark.parametrize("cooperative", [True, False])
+@pytest.mark.parametrize("local_row,actual_tokens", [(1, 2), (-1, 2), (-1, 0)])
+def test_pcp_indexer_forward_updates_only_owner_after_cache_write(monkeypatch, local_row, actual_tokens, cooperative):
+    indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+    torch.nn.Module.__init__(indexer)
+    indexer._use_fused_cache_store = False
+    indexer.enable_sparse_li_c8 = cooperative
+    indexer.enable_sparse_li_c4 = False
+    indexer.c8_k_cache_dtype = torch.int8
+    indexer._quantize_li_tensor = lambda q: (q.to(torch.int8), torch.ones(q.shape[:-1], dtype=torch.float16))
+    monkeypatch.setattr("vllm_ascend.attention.indexer.supports_pcp_indexer_sharding", lambda *args: True)
+    indexer.n_head, indexer.head_dim, indexer.topk_tokens = 2, 4, 4
+    indexer.qk_rope_head_dim = 0
+    indexer.is_rope_neox_style = True
+    indexer.use_torch_npu_lightning_indexer = False
+    indexer.wk_weights_proj = Mock()
+    indexer.wq_b = Mock(return_value=(torch.ones(2, 8), None))
+    key = torch.zeros(2, 128, 1, 4)
+    indexer.k_cache = SimpleNamespace(kv_cache=(key, torch.ones(2, 128, 1, 1)))
+    indexer.forward_k = Mock(return_value=(torch.ones(2, 1, 4), None, torch.ones(2, 2)))
+    events = []
+
+    def gather(k, scale, metadata):
+        events.append("gather_k")
+        return k, scale, metadata.slot_mapping
+
+    indexer._gather_cache_inputs = gather
+    indexer.write_cache = lambda *args: events.append("write_k")
+    monkeypatch.setattr("vllm_ascend.attention.indexer.HAS_TRITON", True)
+    monkeypatch.setattr("vllm_ascend.attention.indexer.rope_forward_triton_siso", lambda q, *args, **kwargs: q)
+    ordinary = torch.tensor([[[0, 1, 2, 3]], [[4, 5, 6, 7]]], dtype=torch.int32)
+    native_output = torch.cat((ordinary[:actual_tokens], ordinary[:1]))
+
+    def native_select(*args, **kwargs):
+        events.append("native_indexer")
+        return native_output, native_scores
+
+    native_scores = torch.ones_like(native_output, dtype=torch.float32)
+    native = Mock(side_effect=native_select)
+    ordinary_native = Mock(return_value=ordinary)
+    monkeypatch.setattr("vllm_ascend.attention.indexer.DeviceOperator.indexer_select_post_process", ordinary_native)
+    monkeypatch.setattr("vllm_ascend.attention.indexer.select_pcp_indexer_candidates", native)
+    final_topk = torch.tensor([[[50, 60, 70, 80]]], dtype=torch.int32)
+
+    def prepare(q, w, scale, metadata):
+        events.append("copy_q")
+        return (
+            torch.cat((q[:actual_tokens], q[:1])),
+            torch.cat((w[:actual_tokens], w[:1])),
+            torch.cat((scale[:actual_tokens], scale[:1])),
+        )
+
+    def finish(indices, scores, metadata, output_tokens):
+        events.append("merge")
+        assert indices is native_output
+        assert scores is native_scores
+        assert output_tokens == 2
+        result = ordinary.clone() if actual_tokens else torch.full_like(ordinary, -1)
+        if local_row >= 0:
+            result[local_row] = final_topk[0]
+        return result
+
+    monkeypatch.setattr("vllm_ascend.attention.indexer.prepare_pcp_indexer_queries", prepare)
+    monkeypatch.setattr("vllm_ascend.attention.indexer.finish_pcp_indexer_topk", finish)
+    shard_lens = torch.tensor([128, 128, 128])
+    query_lens = torch.tensor([1, 2, 2 if local_row >= 0 else 3]) if actual_tokens else torch.tensor([1])
+    batch_table = torch.tensor([[0, 1], [1, 0], [1, 0]])
+    metadata = AscendSFAIndexerMetadata(
+        num_actual_tokens=actual_tokens,
+        slot_mapping=torch.tensor([0, 128]),
+        seq_lens=torch.tensor([128, 256]),
+        cum_query_lens=torch.tensor([1, 2]),
+        block_table=torch.tensor([[0, 1], [1, 0]]),
+        sin=torch.zeros(2, 1, 1, 4),
+        cos=torch.ones(2, 1, 1, 4),
+        actual_seq_lengths_query=torch.tensor([1, 2]),
+        actual_seq_lengths_key=torch.tensor([128, 256]),
+        pcp_indexer=SimpleNamespace(
+            query_row=torch.tensor([local_row]),
+            batch=SimpleNamespace(block_table=batch_table, query_lens=query_lens, key_lens=shard_lens),
+        ),
+    )
+    hidden = torch.ones(2, 8)
+    result = indexer.forward(hidden, hidden, hidden, metadata)
+    if not cooperative:
+        assert events == ["gather_k", "write_k"]
+        native.assert_not_called()
+        assert ordinary_native.call_count == int(actual_tokens > 0)
+        if actual_tokens:
+            torch.testing.assert_close(result, ordinary)
+            assert ordinary_native.call_args.args[7] is metadata
+        else:
+            assert result is None
+        return
+    ordinary_native.assert_not_called()
+    assert events == ["gather_k", "write_k", "copy_q", "native_indexer", "merge"]
+    assert native.call_count == 1
+    assert native.call_args.args[0].shape[0] == actual_tokens + 1
+    assert native.call_args.args[5] is metadata.pcp_indexer
+    assert native.call_args.args[6] == 4
+    assert metadata.actual_seq_lengths_key.tolist() == [128, 256]
+    expected = ordinary.clone() if actual_tokens else torch.full_like(ordinary, -1)
+    if local_row >= 0:
+        expected[local_row] = final_topk[0]
+    torch.testing.assert_close(result, expected)
 
 
 @patch("vllm_ascend.attention.indexer.get_ascend_config")

@@ -23,6 +23,7 @@ from importlib.metadata import version
 import numpy as np
 import torch
 import vllm.v1.worker.gpu.buffer_utils
+from packaging.version import Version
 from vllm.logger import logger
 
 
@@ -34,7 +35,8 @@ def check_triton_ascend_version_valid() -> bool:
     # Triton Ascend versions affected by the UVA pointer validation issue.
     UVA_INCOMPATIBLE_VERSIONS = ("3.2.1", "3.2.2")
     installed_version = version("triton-ascend")
-    if installed_version in UVA_INCOMPATIBLE_VERSIONS:
+    # Development wheels keep the same pointer-validation limitation.
+    if Version(installed_version).base_version in UVA_INCOMPATIBLE_VERSIONS:
         logger.warning(
             "triton-ascend %s disables the UVA feature.\n"
             "Related bug issue: https://github.com/triton-lang/triton-ascend/issues/783",
